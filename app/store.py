@@ -74,11 +74,87 @@ CREATE TABLE IF NOT EXISTS totals (
 CREATE TABLE IF NOT EXISTS manifests (
     batch_id TEXT PRIMARY KEY, json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS ledger_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    version INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS month_closures (
+    month TEXT PRIMARY KEY,
+    batch_id TEXT NOT NULL,
+    closed_at TEXT NOT NULL,
+    amount_yuan TEXT NOT NULL,
+    bills_json TEXT NOT NULL,
+    base_version INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS rereads (
+    reread_id TEXT PRIMARY KEY,
+    base_batch_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    readings_json TEXT NOT NULL,
+    digest TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS reread_bills (
+    reread_id TEXT NOT NULL, month TEXT NOT NULL, meter_id TEXT NOT NULL,
+    usage_kwh TEXT NOT NULL, amount_yuan TEXT NOT NULL,
+    components_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS supplement_runs (
+    request_id TEXT PRIMARY KEY,
+    reread_id TEXT NOT NULL,
+    target_month TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    finished_at TEXT,
+    base_version INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ledger_entries (
+    entry_id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL,
+    reread_id TEXT NOT NULL,
+    target_month TEXT NOT NULL,
+    source_month TEXT NOT NULL,
+    meter_id TEXT NOT NULL,
+    usage_delta TEXT NOT NULL,
+    amount_delta TEXT NOT NULL,
+    components_json TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    reversal_of TEXT,
+    status TEXT NOT NULL,
+    posted_at TEXT,
+    seq INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_entries_source ON ledger_entries(source_month, meter_id);
+CREATE INDEX IF NOT EXISTS idx_entries_request ON ledger_entries(request_id, status);
 """
+
+
+class StaleWrite(Exception):
+    """事务内版本校验失败：决定基于的账本状态已过期。"""
+
+
+class MonthClosed(Exception):
+    """目标月已关账。"""
+
+
+class PostingInFlight(Exception):
+    """该月存在进行中的落账，不能关账。"""
+
+
+class RunStateConflict(Exception):
+    """补账批次状态不允许该操作。"""
 
 
 def _dec(text):
     return None if text is None else Decimal(str(text))
+
+
+def _components_json(components: list[dict]) -> str:
+    """分量落库一律字符串：用量/金额不落 float，也不落 Decimal 对象。"""
+    normalized = [{key: (str(value) if isinstance(value, Decimal) else value)
+                   for key, value in comp.items()} for comp in components]
+    return json.dumps(normalized, ensure_ascii=False)
 
 
 class Store:
@@ -91,6 +167,8 @@ class Store:
                        conn.execute("PRAGMA table_info(batches)").fetchall()}
             if "updated_at" not in columns:
                 conn.execute("ALTER TABLE batches ADD COLUMN updated_at TEXT")
+            conn.execute(
+                "INSERT OR IGNORE INTO ledger_state (id, version) VALUES (1, 0)")
 
     @contextmanager
     def connect(self):
@@ -351,3 +429,228 @@ class Store:
     def _all(self, sql: str, args: tuple) -> list[dict]:
         with self.connect() as conn:
             return [dict(r) for r in conn.execute(sql, args).fetchall()]
+
+    # ---------- 账本：关账 / 回读 / 补账 ----------
+    @staticmethod
+    def _version(conn) -> int:
+        row = conn.execute("SELECT version FROM ledger_state WHERE id=1").fetchone()
+        return int(row["version"]) if row else 0
+
+    @staticmethod
+    def _check_version(conn, expected_version: int) -> None:
+        current = Store._version(conn)
+        if current != expected_version:
+            raise StaleWrite(
+                f"账本版本已变化：决定基于 v{expected_version}，当前 v{current}")
+
+    def ledger_version(self) -> int:
+        with self.connect() as conn:
+            return self._version(conn)
+
+    # ----- 关账 -----
+    def get_closure(self, month: str) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM month_closures WHERE month=?",
+                               (month,)).fetchone()
+        return self._closure(row) if row else None
+
+    def list_closures(self) -> list[dict]:
+        rows = self._all("SELECT * FROM month_closures ORDER BY month", ())
+        return [self._closure(row) for row in rows]
+
+    @staticmethod
+    def _closure(row: dict) -> dict:
+        out = dict(row)
+        out["bills"] = json.loads(out.pop("bills_json"))
+        out["amount_yuan"] = _dec(out["amount_yuan"])
+        return out
+
+    def close_month(self, *, month: str, batch_id: str, closed_at: str,
+                    amount_yuan, bills: list[dict], expected_version: int) -> None:
+        """关账：快照原账并推进账本版本，版本校验与写在同一事务。"""
+        with self.connect() as conn:
+            self._check_version(conn, expected_version)
+            if conn.execute("SELECT 1 FROM month_closures WHERE month=?",
+                            (month,)).fetchone():
+                raise MonthClosed(f"月份 {month} 已关账")
+            if conn.execute(
+                    "SELECT 1 FROM supplement_runs WHERE target_month=? "
+                    "AND status='posting'", (month,)).fetchone():
+                raise PostingInFlight(f"月份 {month} 有进行中的落账，先续跑完成")
+            conn.execute(
+                """INSERT INTO month_closures (month,batch_id,closed_at,amount_yuan,
+                        bills_json,base_version) VALUES (?,?,?,?,?,?)""",
+                (month, batch_id, closed_at, str(amount_yuan),
+                 json.dumps(bills, ensure_ascii=False), expected_version))
+            conn.execute("UPDATE ledger_state SET version=version+1 WHERE id=1")
+
+    # ----- 回读（补读批次） -----
+    def save_reread(self, *, reread: dict, bills: list[dict]) -> None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM rereads"
+                               ).fetchone()
+            seq = int(row["seq"])
+            conn.execute(
+                """INSERT INTO rereads (reread_id,base_batch_id,seq,created_at,note,
+                        readings_json,digest) VALUES (?,?,?,?,?,?,?)""",
+                (reread["reread_id"], reread["base_batch_id"], seq,
+                 reread["created_at"], reread.get("note", ""),
+                 reread["readings_json"], reread["digest"]))
+            for bill in bills:
+                conn.execute(
+                    """INSERT INTO reread_bills (reread_id,month,meter_id,usage_kwh,
+                            amount_yuan,components_json) VALUES (?,?,?,?,?,?)""",
+                    (reread["reread_id"], bill["month"], bill["meter_id"],
+                     str(bill["usage_kwh"]), str(bill["amount_yuan"]),
+                     json.dumps(bill["components"], ensure_ascii=False)))
+
+    def get_reread(self, reread_id: str) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM rereads WHERE reread_id=?",
+                               (reread_id,)).fetchone()
+        return dict(row) if row else None
+
+    def latest_reread(self) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM rereads ORDER BY seq DESC LIMIT 1").fetchone()
+        return dict(row) if row else None
+
+    def list_rereads(self) -> list[dict]:
+        return self._all("SELECT * FROM rereads ORDER BY seq", ())
+
+    def load_reread_bills(self, reread_id: str) -> list[dict]:
+        rows = self._all(
+            "SELECT * FROM reread_bills WHERE reread_id=? ORDER BY month, meter_id",
+            (reread_id,))
+        for r in rows:
+            r["usage_kwh"] = _dec(r["usage_kwh"])
+            r["amount_yuan"] = _dec(r["amount_yuan"])
+            r["components"] = json.loads(r.pop("components_json") or "[]")
+        return rows
+
+    # ----- 补账批次与分录 -----
+    def get_run(self, request_id: str) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM supplement_runs WHERE request_id=?",
+                               (request_id,)).fetchone()
+        return dict(row) if row else None
+
+    def list_runs(self, limit: int = 50) -> list[dict]:
+        return self._all(
+            "SELECT * FROM supplement_runs ORDER BY created_at DESC, rowid DESC LIMIT ?",
+            (limit,))
+
+    def create_run(self, *, run: dict, entries: list[dict],
+                   expected_version: int) -> None:
+        """落账计划入库：版本校验 + 目标月开放校验与写在同一事务。"""
+        with self.connect() as conn:
+            self._check_version(conn, expected_version)
+            if conn.execute("SELECT 1 FROM month_closures WHERE month=?",
+                            (run["target_month"],)).fetchone():
+                raise MonthClosed(f"目标月 {run['target_month']} 已关账")
+            if conn.execute(
+                    "SELECT 1 FROM supplement_runs WHERE reread_id=? "
+                    "AND target_month=? AND status IN ('posting','done')",
+                    (run["reread_id"], run["target_month"])).fetchone():
+                raise RunStateConflict(
+                    f"补读 {run['reread_id']} 到 {run['target_month']} "
+                    "已有补账批次，如需调整请先撤销")
+            conn.execute(
+                """INSERT INTO supplement_runs (request_id,reread_id,target_month,
+                        status,created_at,finished_at,base_version)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (run["request_id"], run["reread_id"], run["target_month"],
+                 run["status"], run["created_at"], run.get("finished_at"),
+                 run["base_version"]))
+            for e in entries:
+                conn.execute(
+                    """INSERT INTO ledger_entries (entry_id,request_id,reread_id,
+                            target_month,source_month,meter_id,usage_delta,
+                            amount_delta,components_json,kind,reversal_of,status,
+                            posted_at,seq) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (e["entry_id"], e["request_id"], e["reread_id"], e["target_month"],
+                     e["source_month"], e["meter_id"], str(e["usage_delta"]),
+                     str(e["amount_delta"]),
+                     _components_json(e["components"]), e["kind"],
+                     e.get("reversal_of"), e["status"], e.get("posted_at"), e["seq"]))
+
+    def pending_entries(self, request_id: str) -> list[dict]:
+        rows = self._all(
+            "SELECT * FROM ledger_entries WHERE request_id=? AND status='pending' "
+            "ORDER BY seq", (request_id,))
+        return [self._entry(row) for row in rows]
+
+    def post_entry(self, entry_id: str, posted_at: str) -> bool:
+        """单笔入账：只从 pending 翻转，重试同一笔不会重复入账。"""
+        with self.connect() as conn:
+            cursor = conn.execute(
+                "UPDATE ledger_entries SET status='posted', posted_at=? "
+                "WHERE entry_id=? AND status='pending'", (posted_at, entry_id))
+            return cursor.rowcount > 0
+
+    def finish_run(self, request_id: str, finished_at: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE supplement_runs SET status='done', finished_at=? "
+                "WHERE request_id=?", (finished_at, request_id))
+            conn.execute("UPDATE ledger_state SET version=version+1 WHERE id=1")
+
+    def reverse_run(self, *, request_id: str, reversal_entries: list[dict],
+                    finished_at: str, expected_version: int) -> None:
+        """撤销补账：反向分录入账，原分录标记 reversed，旧账一行不删。"""
+        with self.connect() as conn:
+            self._check_version(conn, expected_version)
+            row = conn.execute(
+                "SELECT status FROM supplement_runs WHERE request_id=?",
+                (request_id,)).fetchone()
+            if row is None or row["status"] != "done":
+                raise RunStateConflict(f"补账批次 {request_id} 不在可撤销状态")
+            for e in reversal_entries:
+                conn.execute(
+                    """INSERT INTO ledger_entries (entry_id,request_id,reread_id,
+                            target_month,source_month,meter_id,usage_delta,
+                            amount_delta,components_json,kind,reversal_of,status,
+                            posted_at,seq) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (e["entry_id"], e["request_id"], e["reread_id"], e["target_month"],
+                     e["source_month"], e["meter_id"], str(e["usage_delta"]),
+                     str(e["amount_delta"]),
+                     _components_json(e["components"]), e["kind"],
+                     e.get("reversal_of"), e["status"], e.get("posted_at"), e["seq"]))
+            conn.execute(
+                "UPDATE ledger_entries SET status='reversed' WHERE request_id=? "
+                "AND kind='supplement' AND status='posted'", (request_id,))
+            conn.execute(
+                "UPDATE supplement_runs SET status='reversed', finished_at=? "
+                "WHERE request_id=?", (finished_at, request_id))
+            conn.execute("UPDATE ledger_state SET version=version+1 WHERE id=1")
+
+    def list_entries(self, request_id: str | None = None,
+                     limit: int = 200) -> list[dict]:
+        sql = "SELECT * FROM ledger_entries"
+        args: list = []
+        if request_id:
+            sql += " WHERE request_id=?"
+            args.append(request_id)
+        sql += " ORDER BY rowid LIMIT ?"
+        args.append(limit)
+        return [self._entry(row) for row in self._all(sql, tuple(args))]
+
+    def list_accounted_entries(self) -> list[dict]:
+        """计入「已入账净额」的分录：已入账补账（含被撤销的）+ 已入账反向分录。
+
+        被撤销的原分录与它的反向分录同时在账，净额归零；pending 从不计入。
+        """
+        rows = self._all(
+            "SELECT * FROM ledger_entries WHERE "
+            "(kind='supplement' AND status IN ('posted','reversed')) OR "
+            "(kind='reversal' AND status='posted') ORDER BY rowid", ())
+        return [self._entry(row) for row in rows]
+
+    @staticmethod
+    def _entry(row: dict) -> dict:
+        out = dict(row)
+        out["usage_delta"] = _dec(out["usage_delta"])
+        out["amount_delta"] = _dec(out["amount_delta"])
+        out["components"] = json.loads(out.pop("components_json") or "[]")
+        return out

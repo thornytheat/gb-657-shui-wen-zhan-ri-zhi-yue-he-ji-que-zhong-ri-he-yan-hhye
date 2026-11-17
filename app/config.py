@@ -80,6 +80,7 @@ SAMPLES = {
     "readings_header_only.csv": "仅表头",
     "readings_blank.csv": "全空行",
     "readings_bad_header.csv": "表头缺列",
+    "readings_ledger.csv": "关账补账样例 · 跨月补读",
 }
 DEFAULT_SAMPLE = "readings_dirty.csv"
 METERS_FILE = "meters.csv"

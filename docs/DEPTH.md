@@ -1,6 +1,6 @@
 # 深度登记 hydrocalendar（水文站日值月合计缺重日核验）
 
-- 规模：中型（7 个功能模块 / 6 个应用页 / 77 条测试）
+- 规模：中型（8 个功能模块 / 6 个应用页 / 105 条测试）
 - 核心规则：站点日值按版本选择而非后写覆盖，零雨与缺测分开；月合计用 Decimal，并以当地自然日日历核对完整度。
 - 使用者与工作流：流域数据员复核多站逐日雨量、缺重日、月合计与相邻站异常。
 
@@ -15,6 +15,7 @@
 | M5 月量计算 | 按版本选择日值并计算月合计与缺日 | POST /api/hydro/monthly、页面 /months | `app/modules/m5_months/hydro.py` `app/modules/m5_months/allocate.py` `app/modules/m5_months/weights.py` | `tests/test_m5_months.py` `tests/test_hydro_rules.py` |
 | M6 批次与对账 | 跑全流程、查批次历史、看四账、失败重试 | POST /api/runs、GET /api/batches、GET /api/reconcile、页面 /batches | `app/modules/m6_batches/service.py` `app/modules/m6_batches/compare.py` `app/modules/m6_batches/history.py` `app/modules/m6_batches/resume.py` | `tests/test_m6_batches.py` |
 | M7 导出 | 导出单一月报与运行证据 | GET /api/export/monthly.csv、页面 /report | `app/modules/m7_export/evidence.py` `app/modules/m7_export/csv_out.py` `app/modules/m7_export/manifest_out.py` | `tests/test_m7_export.py` |
+| M8 关账补账 | 关账冻结原账、回读重算、差额补到开放月、撤销反向分录、核对 | POST /api/ledger/close、POST /api/ledger/reread、POST /api/ledger/supplement(+resume)、POST /api/ledger/reverse、GET /api/ledger、GET /api/ledger/reconcile | `app/modules/m8_ledger/service.py` `app/modules/m8_ledger/ledger.py` `app/store.py`（账本段） | `tests/test_m8_ledger.py` |
 
 端到端：`tests/test_e2e.py`（脏样例 → 六页 200 → 四账 → 导出，含 4xx 失败输入与幂等重跑）。
 不变量：`tests/test_invariants.py`（区间账 = 月度账、幂等重跑行数不变、月桶划分、账单闭合、读数分区）。
@@ -38,6 +39,10 @@
 | TRAP-18 | 0 字节文件、只有表头、数据行全是空行 | 三种都返回「成功导入 0 行」，或直接除零 | 三个文件级原因码分开返回，不落半批数据 | `app/modules/m1_ingest/service.py` | `tests/test_m1_ingest.py::test_empty_states_return_distinct_codes` |
 | TRAP-23 | 区间止点与下一段起点都算一次 | 相邻区间重复计入一天，月度用量偏高 | 区间与月桶都声明左闭右开 `[起, 止)`，相邻段首尾相接 | `app/modules/m5_months/weights.py`、`app/modules/m4_intervals/restore.py` | `tests/test_m5_months.py::test_month_slices_are_half_open`、`tests/test_m4_intervals.py::test_intervals_are_half_open_and_contiguous` |
 | TRAP-24 | 各月/各分量各自四舍五入后合计不等 | 分完差 0.001~0.02，账永远差几分 | 最大余额法分月；分量残差并入最大分量；账单先合计再舍入，分项补差 | `app/modules/m5_months/weights.py`、`app/modules/m5_months/tou.py` | `tests/test_m5_months.py::test_largest_remainder_keeps_total_exact`、`tests/test_m5_months.py::test_tou_components_closed_to_total` |
+| TRAP-25 | 关账后补读，直接覆盖已关账月份 | 已关账应收被改，审计对不上；冻结不收又漏退款 | 关账只写快照；差额 = 最新应收 −（原账 + 已入账净额），正补收负退补，都记到指定开放月分录 | `app/modules/m8_ledger/ledger.py` | `tests/test_m8_ledger.py::test_supplement_posts_cross_month_signed_diffs_to_open_month` |
+| TRAP-26 | 补账落账到一半进程中断 | 重跑全量重补 → 同一差额收两次 | 分录逐笔 pending → posted，中断留 posting 批次，续跑只补 pending；同笔重试幂等重放 | `app/modules/m8_ledger/service.py`、`app/store.py` | `tests/test_m8_ledger.py::test_interrupted_posting_resumes_without_double_charge`、`tests/test_m8_ledger.py::test_same_request_retry_never_double_charges` |
+| TRAP-27 | 关账与补账并发，双方各按旧状态决定 | 补到刚关账的月，或关账漏掉在途差额 | 账本版本号：每个决定带 expected_version，事务内校验，过期决定 409；进行中落账的月不许关账 | `app/store.py`（`_check_version`） | `tests/test_m8_ledger.py::test_stale_decisions_rejected_on_close_and_supplement`、`tests/test_m8_ledger.py::test_close_blocked_while_posting_in_flight` |
+| TRAP-28 | 撤销补账直接删分录 | 旧账消失，净额链条断裂 | 反向分录冲销：原分录置 reversed 不删，反向分录 posted，两者同时在账净额归零 | `app/modules/m8_ledger/service.py`、`app/store.py` | `tests/test_m8_ledger.py::test_reverse_uses_reversal_entries_and_keeps_originals` |
 
 ## 对账规则
 
@@ -45,6 +50,7 @@
 - 区间账：主寄存器（总表优先）区间用量合计 = 月度分摊用量合计（0.001 kWh，逐位相等）。
 - 月度账：同月同表「总表 = 峰 + 平 + 谷」，闭合后的残差必须为 0，闭合前的尾差条数单独计数。
 - 账单账：账单金额 = 分项金额之和（分项先截尾再补分），四账在 `/` 与 `/batches` 页、`/api/reconcile`、运行清单里同源显示。
+- 账本账：已关账月的「原账快照 + 已入账净补账 = 最新补读重算应收」，逐 (月, 表) 在 `/api/ledger/reconcile` 核对，未落账的差额显示为 drift。
 
 ## 反例与不变量
 
@@ -55,7 +61,9 @@
 ## 已知不覆盖
 
 - 只支持单表计的单向有功读数；双向表（正/反向分别累计）、需量寄存器、无功寄存器一律按 `Q_BAD_REGISTER` 隔离。
-- 电价固定读 `sample_data/prices.csv`（峰 1.05 / 平 0.65 / 谷 0.32 元每 kWh），没有分时日历、阶梯电价与容量电费。
+- 电价固定读 `sample_data/prices.csv`（峰 1.05 / 平 0.65 / 谷 0.32 元每 kWh），没有分时日历、阶梯电价与容量电费；补账差额也按这份原价计。
+- 补账只到分录层（应收台账），不接支付、核销与票据；撤销只支持整批反向冲销，不支持单笔分录撤销。
+- 补读是在基准批次上追加读数（不改原批次数据）；「最新应收」以最新补读批次为准，补读批次不累计此前批次的读数时，差额会按最新批次回补。
 - 换表链只支持一段（旧表 → 新表）；链式多次换表能识别但只在最后一段起算，中间段会缺口。
 - 时区按固定 +08:00 处理，不引入 DST；跨时区台区不支持。
 - 并行抄表同一时刻多条读数只按「取值是否一致」判定冲突，没有设备侧时钟偏移校正。

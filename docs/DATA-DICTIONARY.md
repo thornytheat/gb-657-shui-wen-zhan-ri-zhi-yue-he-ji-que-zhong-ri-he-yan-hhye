@@ -77,8 +77,28 @@
 
 文件级 `E_*`：`E_EMPTY_FILE`、`E_HEADER_ONLY`、`E_ALL_BLANK`、`E_HEADER_INVALID`、`E_DECODE`、`E_SAMPLE_UNKNOWN`、`E_CONTRACT_INVALID`、`E_BATCH_NOT_FOUND`。
 
+账本级 `E_*`：`E_LEDGER_STALE`（决定基于的账本版本已过期）、`E_LEDGER_VERSION_REQUIRED`、`E_MONTH_CLOSED`、`E_MONTH_NOT_CLOSED`、`E_MONTH_UNKNOWN`、`E_TARGET_MONTH_INVALID`、`E_POSTING_IN_FLIGHT`、`E_REREAD_INVALID`、`E_REREAD_NOT_FOUND`、`E_RUN_NOT_FOUND`、`E_RUN_NOT_DONE`、`E_RUN_MISMATCH`、`E_RUN_ACTIVE`、`E_BATCH_NOT_DONE`。
+
 行级 `Q_*`：`Q_COLUMN_COUNT`、`Q_TRUNCATED_ROW`、`Q_MISSING_READING`、`Q_BAD_READING`、`Q_BAD_TIME`、`Q_UNKNOWN_METER`、`Q_BAD_REGISTER`、`Q_BAD_UNIT`、`Q_BAD_READ_TYPE`、`Q_NEGATIVE_READING`、`Q_EXCEEDS_CAPACITY`、`Q_REVERSE_READING`、`Q_DUPLICATE_CONFLICT`、`Q_METER_RETIRED`。
 
 标记 `K_*`：`K_ROLLOVER`、`K_REPLACEMENT_FIRST`、`K_ESTIMATE_SKIPPED`、`K_CHARSET_FALLBACK`、`K_BOM_STRIPPED`、`K_SEGMENT_SPLIT`、`K_TRUNCATED_TAIL`、`K_TOU_ADJUSTED`、`K_BILL_ROUNDED`、`K_UNIT_ASSUMED`、`K_UNIT_CONVERTED`、`K_DUPLICATE_IDENTICAL`。
 
 唯一来源：`app/reasons.py`；页面与导出的原因文案都从它取。
+
+## 10 账本（关账 / 回读 / 补账）
+
+| 表 | 键 | 含义 |
+|---|---|---|
+| `ledger_state` | `id=1` | 单行账本版本号；关账 / 落账完成 / 撤销各 +1 |
+| `month_closures` | `month` | 关账快照：批次、时刻、原账账单 JSON（`bills_json`）、合计 |
+| `rereads` | `reread_id` | 补读批次：基准批次、补读行 JSON、内容摘要（幂等键）、序号 |
+| `reread_bills` | `(reread_id, month, meter_id)` | 补读重算的最新应收（不动原批次账单） |
+| `supplement_runs` | `request_id` | 补账批次（幂等键）：补读批次、目标开放月、状态 `posting/done/reversed` |
+| `ledger_entries` | `entry_id` | 分录：原月、目标月、表号、用量/金额差额、分量差额、种类与状态 |
+
+- 分录 `kind`：`supplement`（补账）/ `reversal`（反向分录，`reversal_of` 指向原分录）。
+- 分录 `status`：`pending` → `posted` →（被撤销时）`reversed`；反向分录入账即 `posted`。
+- 已入账净额 = 已入账补账分录（含被撤销的）+ 已入账反向分录；`pending` 从不计入。
+- 差额 = 最新应收 −（原账 + 已入账净额），正数补收（`charge`）、负数退补（`refund`），金额按原价表计算；金额为 0 不落分录。
+- 分量差额 = 最新分量 − 原账分量 − 已入账分量差额，分量合计与分录额逐分相等。
+- 每个决定（关账 / 补账 / 撤销）必须带 `expected_version`，事务内与当前版本比对，不一致即 `E_LEDGER_STALE`（409）。
